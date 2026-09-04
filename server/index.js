@@ -1,4 +1,5 @@
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -8,71 +9,245 @@ const port = 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' })); // We need a high limit to accept base64 images
+
+// High limit because screenshots are sent as base64
+app.use(express.json({
+  limit: '50mb'
+}));
 
 // Initialize Gemini
-// Ensure you have GEMINI_API_KEY set in a .env file
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const genAI = new GoogleGenerativeAI(
+  process.env.GEMINI_API_KEY
+);
 
-app.post('/api/analyze', async (req, res) => {
+/*
+  Simple validation helper.
+
+  We don't force a complex schema here because
+  Gemini already receives a strict JSON prompt.
+
+  This just prevents obviously invalid responses
+  from being returned as successful plans.
+*/
+function validateAgentResponse(text) {
+
   try {
-    const { imageBase64, prompt } = req.body;
 
-    if (!imageBase64) {
-      return res.status(400).json({ error: 'No image provided' });
+    const cleaned = text
+      .replace(/```json/g, '')
+      .replace(/```/g, '')
+      .trim();
+
+    const parsed = JSON.parse(cleaned);
+
+    if (!parsed || typeof parsed !== 'object') {
+      return {
+        valid: false,
+        error: 'Response is not an object'
+      };
     }
 
-    // Strip the data:image/png;base64, prefix if present
-    const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+    if (parsed.status === 'done') {
+      return {
+        valid: true,
+        data: parsed
+      };
+    }
 
-    const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash" });
+    /*
+      New multi-step schema
+    */
+    if (Array.isArray(parsed.actions)) {
+
+      return {
+        valid: true,
+        data: parsed
+      };
+    }
+
+    /*
+      Backward compatibility with old schema
+    */
+    if (parsed.action) {
+
+      return {
+        valid: true,
+        data: parsed
+      };
+    }
+
+    return {
+      valid: false,
+      error: 'No actions or status found'
+    };
+
+  } catch (error) {
+
+    return {
+      valid: false,
+      error: error.message
+    };
+  }
+}
+
+app.post('/api/analyze', async (req, res) => {
+
+  try {
+
+    const {
+      imageBase64,
+      prompt
+    } = req.body;
+
+    if (!imageBase64) {
+
+      return res.status(400).json({
+        error: 'No image provided'
+      });
+    }
+
+    /*
+      Remove:
+      data:image/png;base64,
+    */
+    const base64Data = imageBase64.replace(
+      /^data:image\/\w+;base64,/,
+      ''
+    );
 
     const imagePart = {
       inlineData: {
         data: base64Data,
-        mimeType: "image/png"
-      },
+        mimeType: 'image/png'
+      }
     };
 
-    console.log("Sending image to Gemini for analysis...");
-    
+    console.log(
+      'Sending image to Gemini for analysis...'
+    );
+
+    /*
+      Keep existing fallback strategy
+    */
     const modelsToTry = [
-      "gemini-3.6-flash",
-      "gemini-3.5-flash",
-      "gemini-3.5-flash-lite"
+
+      'gemini-3.6-flash',
+
+      'gemini-3.5-flash',
+
+      'gemini-3.5-flash-lite'
     ];
-    
+
     let lastError = null;
 
     for (const modelName of modelsToTry) {
+
       try {
-        console.log(`Attempting with model: ${modelName}...`);
-        const modelConfig = { model: modelName, generationConfig: { responseMimeType: "application/json" } };
-        const model = genAI.getGenerativeModel(modelConfig);
-        const result = await model.generateContent([
-          prompt || "Describe what is on this screen and what the user can do next. The image has sensitive data redacted with black boxes.", 
-          imagePart
-        ]);
-        const response = await result.response;
-        const text = response.text();
-        console.log(`Success! Received response from ${modelName}`);
-        return res.json({ success: true, result: text });
-      } catch (e) {
-        console.log(`Model ${modelName} failed with status: ${e.status}. Trying next...`);
-        lastError = e;
+
+        console.log(
+          `Attempting with model: ${modelName}...`
+        );
+
+        const modelConfig = {
+
+          model: modelName,
+
+          generationConfig: {
+            responseMimeType: 'application/json'
+          }
+        };
+
+        const model =
+          genAI.getGenerativeModel(
+            modelConfig
+          );
+
+        const result =
+          await model.generateContent([
+
+            prompt ||
+              'Describe what is on this screen and what the user can do next.',
+
+            imagePart
+          ]);
+
+        const response =
+          await result.response;
+
+        const text =
+          response.text();
+
+        /*
+          Validate Gemini response
+        */
+        const validation =
+          validateAgentResponse(text);
+
+        if (!validation.valid) {
+
+          console.warn(
+            `Invalid JSON structure from ${modelName}:`,
+            validation.error
+          );
+
+          throw new Error(
+            `Invalid agent response: ${validation.error}`
+          );
+        }
+
+        console.log(
+          `Success! Received valid response from ${modelName}`
+        );
+
+        /*
+          Return normalized JSON string.
+
+          Background.js can continue using
+          JSON.parse(data.result)
+        */
+        return res.json({
+
+          success: true,
+
+          result: JSON.stringify(
+            validation.data
+          )
+        });
+
+      } catch (error) {
+
+        console.log(
+          `Model ${modelName} failed:`,
+          error.message
+        );
+
+        lastError = error;
       }
     }
 
-    // If we get here, all models failed
     throw lastError;
 
   } catch (error) {
-    console.error("Error processing request:", error);
-    res.status(500).json({ error: 'Failed to analyze image' });
+
+    console.error(
+      'Error processing request:',
+      error
+    );
+
+    res.status(500).json({
+      error: 'Failed to analyze image',
+      details: error.message
+    });
   }
 });
 
 app.listen(port, () => {
-  console.log(`SIH Vision Agent Server running at http://localhost:${port}`);
-  console.log(`Ensure your GEMINI_API_KEY is set in a .env file`);
+
+  console.log(
+    `SIH Vision Agent Server running at http://localhost:${port}`
+  );
+
+  console.log(
+    'Ensure GEMINI_API_KEY is set in your .env file'
+  );
 });
